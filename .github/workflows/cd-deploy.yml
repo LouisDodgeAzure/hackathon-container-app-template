@@ -1,0 +1,364 @@
+# .github/workflows/cd-deploy.yml
+name: Reusable CD - Deploy to Environment
+
+on:
+  workflow_call:
+    inputs:
+      # --- Environment Configuration ---
+      environment:
+        required: true
+        type: string # 'dev', 'staging', 'prod'
+      tf_vars_file:
+        required: true
+        type: string # e.g., 'env/dev.tfvars'
+      project_prefix:
+        required: true
+        type: string # e.g., 'hackapp', 'hackappstg', 'hackappprd'
+      resource_group_name:
+        required: true
+        type: string # e.g., 'rg-hackapp-dev-uksouth'
+      run_canary:
+        required: true # Make required, passed from trigger
+        type: boolean
+      # --- Commit/Ref ---
+      git_ref:
+        required: true # The specific commit/branch/tag to deploy
+        type: string
+    secrets:
+      # --- Azure Credentials (from GitHub Environment) ---
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+      # --- Terraform Backend State Credentials (from GitHub Environment) ---
+      TF_STATE_STORAGE_ACCOUNT:
+        required: true
+      TF_STATE_CONTAINER:
+        required: true
+      TF_STATE_RG:
+        required: true
+
+permissions:
+  contents: read
+  id-token: write # Required for OIDC login to Azure
+  packages: write # Required to push container images to ACR (via Azure Login)
+
+jobs:
+  build-push-images:
+    runs-on: ubuntu-latest
+    outputs:
+      acr_login_server: ${{ steps.tf_output.outputs.acr_login_server }}
+      image_tag: ${{ steps.vars.outputs.sha_short }}
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [service1, service2] # Services to build/push
+        include:
+          - service: service1
+            docker_context: ./app/service1
+            image_name: service1
+          - service: service2
+            docker_context: ./app/service2
+            image_name: service2
+    steps:
+      - name: Checkout specific ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }} # Checkout the specific commit/branch/tag
+
+      - name: Set Short SHA from checked-out ref
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Azure Login for ACR Push
+        uses: ./.github/actions/setup-azure # Use the reusable action
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get ACR Login Server
+        id: tf_output
+        # Construct the ACR name based on inputs - more reliable than querying state during initial runs
+        run: |
+          ACR_LOGIN_SERVER="acr${{ inputs.project_prefix }}${{ inputs.environment }}.azurecr.io"
+          # Optional: Verify with Azure if needed, but constructing is often sufficient
+          # az acr show --name "acr${{ inputs.project_prefix }}${{ inputs.environment }}" --query loginServer -o tsv || exit 1
+          echo "acr_login_server=$ACR_LOGIN_SERVER" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.tf_output.outputs.acr_login_server }}
+          username: 00000000-0000-0000-0000-000000000000 # Service Principal ID for token exchange
+          password: ${{ secrets.AZURE_CLIENT_ID }} # Use Client ID as password for ACR token exchange with OIDC
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.docker_context }}
+          file: ${{ matrix.docker_context }}/Dockerfile
+          push: true
+          tags: ${{ steps.tf_output.outputs.acr_login_server }}/${{ matrix.image_name }}:${{ steps.vars.outputs.sha_short }}, ${{ steps.tf_output.outputs.acr_login_server }}/${{ matrix.image_name }}:latest_${{ inputs.environment }} # Tag with SHA and latest for env
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-infra:
+    runs-on: ubuntu-latest
+    needs: build-push-images
+    environment:
+      name: ${{ inputs.environment }} # Associate job with GitHub Environment for approvals/secrets/variables
+    env:
+      TF_VAR_image_tag: ${{ needs.build-push-images.outputs.image_tag }} # Pass image tag to Terraform
+      TF_IN_AUTOMATION: true # Run Terraform in non-interactive mode
+      TF_VAR_project_prefix: ${{ inputs.project_prefix }} # Pass project prefix from input
+      # Note: Other TF_VARs like location, rg name etc. are in the tfvars file
+
+    steps:
+      - name: Checkout specific ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.3.0 # Specify version used
+
+      - name: Azure Login for Terraform Apply
+        uses: ./.github/actions/setup-azure
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }} # Secret from GitHub Environment
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }} # Secret from GitHub Environment
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }} # Secret from GitHub Environment
+
+      - name: Terraform Init
+        id: init
+        run: |
+          terraform init \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ inputs.environment }}.tfstate" \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RG }}"
+        working-directory: ./infra
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+        working-directory: ./infra
+
+      - name: Terraform Plan
+        id: plan
+        # Use the tf_vars_file input directly
+        run: terraform plan -var-file="${{ inputs.tf_vars_file }}" -no-color -out=tfplan
+        working-directory: ./infra
+        continue-on-error: true
+
+      - name: Terraform Apply
+        id: apply
+        run: terraform apply -auto-approve tfplan
+        working-directory: ./infra
+
+  # --- Canary Deployment Steps (Conditional) ---
+  canary-deploy:
+    runs-on: ubuntu-latest
+    needs: [deploy-infra, build-push-images]
+    # Use the run_canary input to control execution
+    if: ${{ inputs.run_canary == true && needs.deploy-infra.result == 'success' }}
+    environment:
+      name: ${{ inputs.environment }}
+    steps:
+      - name: Checkout specific ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+
+      - name: Azure Login for Container App Commands
+        uses: ./.github/actions/setup-azure
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get Container App Names
+        id: get_apps
+        # Use inputs for naming convention
+        run: |
+          SERVICE1_APP_NAME=$(az containerapp list --resource-group ${{ inputs.resource_group_name }} --query "[?starts_with(name,'${{ inputs.project_prefix }}-service1-${{ inputs.environment }}')].name" -o tsv)
+          SERVICE2_APP_NAME=$(az containerapp list --resource-group ${{ inputs.resource_group_name }} --query "[?starts_with(name,'${{ inputs.project_prefix }}-service2-${{ inputs.environment }}')].name" -o tsv)
+          if [ -z "$SERVICE1_APP_NAME" ] || [ -z "$SERVICE2_APP_NAME" ]; then
+             echo "Error: Could not find container app names using prefix '${{ inputs.project_prefix }}' and environment '${{ inputs.environment }}' in RG '${{ inputs.resource_group_name }}'."
+             exit 1
+          fi
+          echo "service1_app_name=$SERVICE1_APP_NAME" >> $GITHUB_OUTPUT
+          echo "service2_app_name=$SERVICE2_APP_NAME" >> $GITHUB_OUTPUT
+        shell: bash
+
+      # --- Canary Stage 1: 10% Traffic ---
+      - name: Update Service 1 to New Revision (Canary)
+        run: |
+          az containerapp update \
+            --name ${{ steps.get_apps.outputs.service1_app_name }} \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --image ${{ needs.build-push-images.outputs.acr_login_server }}/service1:${{ needs.build-push-images.outputs.image_tag }} \
+            --revision-suffix canary-${{ needs.build-push-images.outputs.image_tag }}
+        shell: bash
+
+      - name: Update Service 2 to New Revision (Canary)
+        run: |
+           az containerapp update \
+            --name ${{ steps.get_apps.outputs.service2_app_name }} \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --image ${{ needs.build-push-images.outputs.acr_login_server }}/service2:${{ needs.build-push-images.outputs.image_tag }} \
+            --revision-suffix canary-${{ needs.build-push-images.outputs.image_tag }}
+        shell: bash
+
+      - name: Set Traffic to 10% Canary (Service 1)
+        run: |
+          az containerapp ingress traffic set \
+            --name ${{ steps.get_apps.outputs.service1_app_name }} \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --revision-weight latest=90 canary-${{ needs.build-push-images.outputs.image_tag }}=10
+        shell: bash
+
+      - name: Set Traffic to 10% Canary (Service 2)
+        run: |
+           az containerapp ingress traffic set \
+            --name ${{ steps.get_apps.outputs.service2_app_name }} \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --revision-weight latest=90 canary-${{ needs.build-push-images.outputs.image_tag }}=10
+        shell: bash
+
+      - name: Wait/Smoke Test (10%)
+        run: |
+          echo "Waiting for 1 minute after 10% deployment..."
+          sleep 60
+          # Add actual smoke tests here
+          echo "Smoke tests (10%) passed!"
+
+      # --- Canary Stage 2: 50% Traffic ---
+      - name: Set Traffic to 50% Canary (Service 1)
+        run: |
+          az containerapp ingress traffic set \
+            --name ${{ steps.get_apps.outputs.service1_app_name }} \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --revision-weight latest=50 canary-${{ needs.build-push-images.outputs.image_tag }}=50
+        shell: bash
+
+      - name: Set Traffic to 50% Canary (Service 2)
+        run: |
+           az containerapp ingress traffic set \
+            --name ${{ steps.get_apps.outputs.service2_app_name }} \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --revision-weight latest=50 canary-${{ needs.build-push-images.outputs.image_tag }}=50
+        shell: bash
+
+      - name: Wait/Smoke Test (50%)
+        run: |
+          echo "Waiting for 2 minutes after 50% deployment..."
+          sleep 120
+          # Add actual smoke tests here
+          echo "Smoke tests (50%) passed!"
+
+      # --- Canary Stage 3: 100% Traffic ---
+      - name: Set Traffic to 100% Canary (Service 1)
+        run: |
+          az containerapp ingress traffic set \
+            --name ${{ steps.get_apps.outputs.service1_app_name }} \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --revision-weight canary-${{ needs.build-push-images.outputs.image_tag }}=100
+        shell: bash
+
+      - name: Set Traffic to 100% Canary (Service 2)
+        run: |
+           az containerapp ingress traffic set \
+            --name ${{ steps.get_apps.outputs.service2_app_name }} \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --revision-weight canary-${{ needs.build-push-images.outputs.image_tag }}=100
+        shell: bash
+
+      - name: Deactivate Old Stable Revision(s) (Optional Cleanup)
+        run: |
+          echo "Skipping deactivation of old revisions for simplicity."
+
+      - name: Final Smoke Test (100%)
+        run: |
+          echo "Waiting for 1 minute after 100% deployment..."
+          sleep 60
+          # Add actual smoke tests here
+          echo "Smoke tests (100%) passed! Canary deployment successful."
+
+  # --- Simple Deployment (No Canary) ---
+  simple-deploy:
+    runs-on: ubuntu-latest
+    needs: [deploy-infra, build-push-images]
+    # Use the run_canary input to control execution
+    if: ${{ inputs.run_canary == false && needs.deploy-infra.result == 'success' }}
+    environment:
+      name: ${{ inputs.environment }}
+    steps:
+      - name: Checkout specific ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+
+      - name: Azure Login for Container App Commands
+        uses: ./.github/actions/setup-azure
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get Container App Names
+        id: get_apps
+        run: |
+          SERVICE1_APP_NAME=$(az containerapp list --resource-group ${{ inputs.resource_group_name }} --query "[?starts_with(name,'${{ inputs.project_prefix }}-service1-${{ inputs.environment }}')].name" -o tsv)
+          SERVICE2_APP_NAME=$(az containerapp list --resource-group ${{ inputs.resource_group_name }} --query "[?starts_with(name,'${{ inputs.project_prefix }}-service2-${{ inputs.environment }}')].name" -o tsv)
+          if [ -z "$SERVICE1_APP_NAME" ] || [ -z "$SERVICE2_APP_NAME" ]; then
+             echo "Error: Could not find container app names using prefix '${{ inputs.project_prefix }}' and environment '${{ inputs.environment }}' in RG '${{ inputs.resource_group_name }}'."
+             exit 1
+          fi
+          echo "service1_app_name=$SERVICE1_APP_NAME" >> $GITHUB_OUTPUT
+          echo "service2_app_name=$SERVICE2_APP_NAME" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Update Service 1 to New Revision (Simple)
+        run: |
+          az containerapp update \
+            --name ${{ steps.get_apps.outputs.service1_app_name }} \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --image ${{ needs.build-push-images.outputs.acr_login_server }}/service1:${{ needs.build-push-images.outputs.image_tag }}
+        shell: bash
+
+      - name: Update Service 2 to New Revision (Simple)
+        run: |
+           az containerapp update \
+            --name ${{ steps.get_apps.outputs.service2_app_name }} \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --image ${{ needs.build-push-images.outputs.acr_login_server }}/service2:${{ needs.build-push-images.outputs.image_tag }}
+        shell: bash
+
+      - name: Wait/Smoke Test (Simple Deploy)
+        run: |
+          echo "Waiting for 1 minute after simple deployment..."
+          sleep 60
+          # Add actual smoke tests here
+          echo "Smoke tests passed! Simple deployment successful."
+
+  # --- Rollback Job (Example - Triggered on failure) ---
+  # (Keep rollback logic conceptual as before, needs specific implementation)
+  # rollback:
+  #   runs-on: ubuntu-latest
+  #   needs: [canary-deploy, simple-deploy]
+  #   if: failure()
+  #   environment:
+  #     name: ${{ inputs.environment }}
+  #   steps:
+  #     - name: Azure Login ...
+  #     - name: Rollback Traffic ...

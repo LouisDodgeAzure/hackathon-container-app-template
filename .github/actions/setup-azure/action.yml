@@ -1,0 +1,37 @@
+# .github/actions/setup-azure/action.yml
+name: 'Azure Login via OIDC'
+description: 'Logs into Azure using OIDC and sets up Terraform environment variables'
+inputs:
+  client-id:
+    description: 'Azure Client ID (Application ID) of the Service Principal'
+    required: true
+  tenant-id:
+    description: 'Azure Tenant ID'
+    required: true
+  subscription-id:
+    description: 'Azure Subscription ID'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Azure Login using OIDC
+      uses: azure/login@v1
+      with:
+        client-id: ${{ inputs.client-id }}
+        tenant-id: ${{ inputs.tenant-id }}
+        subscription-id: ${{ inputs.subscription-id }}
+        enable-AzPSSession: false # Set to true if PowerShell is needed
+
+    - name: Set Terraform Environment Variables for OIDC
+      shell: bash
+      run: |
+        echo "ARM_CLIENT_ID=${{ inputs.client-id }}" >> $GITHUB_ENV
+        echo "ARM_TENANT_ID=${{ inputs.tenant-id }}" >> $GITHUB_ENV
+        echo "ARM_SUBSCRIPTION_ID=${{ inputs.subscription-id }}" >> $GITHUB_ENV
+        echo "ARM_USE_OIDC=true" >> $GITHUB_ENV # Tell Terraform provider to use OIDC
+
+    - name: Verify Azure Login
+      shell: bash
+      run: |
+        az account show

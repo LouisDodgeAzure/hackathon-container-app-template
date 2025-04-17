@@ -1,0 +1,45 @@
+# docker-compose.yml for local development
+# Run from the 'app/' directory: docker-compose up --build
+
+version: '3.8' # Use a recent version
+
+services:
+  service1:
+    build:
+      context: ./service1 # Path to the Dockerfile directory for service1
+      dockerfile: Dockerfile
+    container_name: service1-local
+    ports:
+      - "8080:8080" # Map host port 8080 to container port 8080
+    environment:
+      - PORT=8080
+      - ENVIRONMENT=local
+      - SERVICE_NAME=Service 1 (Local)
+      # Add any other environment variables needed locally
+    # volumes:
+      # - ./service1/src:/usr/src/app/src # Optional: Mount local code for hot-reloading (if framework supports it)
+    restart: unless-stopped # Restart policy for local dev
+
+  service2:
+    build:
+      context: ./service2 # Path to the Dockerfile directory for service2
+      dockerfile: Dockerfile
+    container_name: service2-local
+    ports:
+      - "5000:5000" # Map host port 5000 to container port 5000
+    environment:
+      - PORT=5000
+      - ENVIRONMENT=local
+      - SERVICE_NAME=Service 2 (Local)
+      - FLASK_ENV=development # Enable Flask debug mode locally
+      # Add any other environment variables needed locally
+    # volumes:
+      # - ./service2/src:/usr/src/app/src # Optional: Mount local code for hot-reloading
+    restart: unless-stopped
+    # depends_on: # Uncomment if service2 depends on service1 starting first
+    #   - service1
+
+# Add other services like databases, caches, etc. needed for local development
+# networks: # Define custom networks if needed
+#   app-network:
+#     driver: bridge

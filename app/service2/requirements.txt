@@ -1,0 +1,4 @@
+Flask>=2.0.0
+# Add other dependencies here, e.g.:
+# requests
+# gunicorn # Often used for production WSGI server instead of Flask dev server

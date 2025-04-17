@@ -1,0 +1,70 @@
+# .github/workflows/cd-trigger.yml
+name: CD - Trigger Deployment
+
+on:
+  # Trigger deployment to 'dev' automatically when 'main' branch is updated
+  push:
+    branches:
+      - main
+
+  # Allow manual triggering for promotion (typically to 'prod')
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment for manual promotion (usually prod)'
+        required: true
+        type: environment # Use environment type for dropdown list based on repo environments
+      commit_sha:
+        description: 'Optional: Specific commit SHA to deploy (defaults to latest commit on default branch)'
+        required: false
+        default: '' # Default to empty, workflow will use github.sha or github.ref
+
+permissions: read-only # Permissions are handled by the called workflow
+
+jobs:
+  trigger-deployment:
+    runs-on: ubuntu-latest
+    # Determine target environment: 'dev' for push to main, input for dispatch
+    environment: ${{ github.event_name == 'push' && 'dev' || github.event.inputs.environment }}
+
+    steps:
+      # Step to determine inputs for the reusable workflow based on trigger type
+      - name: Determine Deployment Parameters
+        id: params
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "TARGET_ENV=dev" >> $GITHUB_OUTPUT
+            echo "GIT_REF=${{ github.ref }}" >> $GITHUB_OUTPUT # Use branch ref for push
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "TARGET_ENV=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+            # Use specified commit SHA if provided, otherwise use the ref the workflow runs on
+            GIT_REF="${{ github.event.inputs.commit_sha }}"
+            if [[ -z "$GIT_REF" ]]; then
+              GIT_REF="${{ github.ref }}"
+            fi
+            echo "GIT_REF=$GIT_REF" >> $GITHUB_OUTPUT
+          else
+            echo "Error: Unsupported event type ${{ github.event_name }}"
+            exit 1
+          fi
+        shell: bash
+
+      # Call the reusable deployment workflow
+      # Secrets and Variables are automatically sourced from the selected GitHub Environment
+      - name: Call Reusable Deploy Workflow
+        uses: ./.github/workflows/cd-deploy.yml@${{ steps.params.outputs.GIT_REF }} # Use the determined ref
+        with:
+          environment: ${{ steps.params.outputs.TARGET_ENV }}
+          tf_vars_file: ${{ vars.TF_VARS_FILE }}             # Variable from GitHub Environment
+          project_prefix: ${{ vars.PROJECT_PREFIX }}         # Variable from GitHub Environment
+          resource_group_name: ${{ vars.RESOURCE_GROUP_NAME }} # Variable from GitHub Environment
+          run_canary: ${{ vars.RUN_CANARY == 'true' }}       # Variable from GitHub Environment (convert string to boolean)
+          git_ref: ${{ steps.params.outputs.GIT_REF }}       # Pass the determined ref
+        secrets:
+          # Secrets are inherited from the GitHub Environment context
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          TF_STATE_STORAGE_ACCOUNT: ${{ secrets.TF_STATE_STORAGE_ACCOUNT }}
+          TF_STATE_CONTAINER: ${{ secrets.TF_STATE_CONTAINER }}
+          TF_STATE_RG: ${{ secrets.TF_STATE_RG }}
