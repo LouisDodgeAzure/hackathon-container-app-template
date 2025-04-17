@@ -12,7 +12,7 @@ set -o pipefail # Causes pipelines to fail on the first command that fails
 # Environment definitions (Customize these names/prefixes as needed)
 declare -A ENV_CONFIG
 ENV_CONFIG[dev,app_rg_suffix]="dev-app"        # e.g., rg-ld-hack-dev-app-uksouth
-ENV_CONFIG[dev,project_prefix]="hackapp"       # Matches infra/env/dev.tfvars
+ENV_CONFIG[dev,project_prefix]="hackappdev"       # Matches infra/env/dev.tfvars
 ENV_CONFIG[dev,tfvars_file]="env/dev.tfvars"
 ENV_CONFIG[dev,run_canary]="false"
 ENV_CONFIG[dev,location]="uksouth"             # Location for the app resources
@@ -27,7 +27,7 @@ ENV_CONFIG[prod,app_rg_suffix]="prd-app"       # e.g., rg-ld-hack-prd-app-eastus
 ENV_CONFIG[prod,project_prefix]="hackappprd"   # Matches infra/env/prod.tfvars
 ENV_CONFIG[prod,tfvars_file]="env/prod.tfvars"
 ENV_CONFIG[prod,run_canary]="true"
-ENV_CONFIG[prod,location]="eastus"             # Location for the app resources
+ENV_CONFIG[prod,location]="uksouth"             # Location for the app resources
 
 # --- Helper Functions ---
 

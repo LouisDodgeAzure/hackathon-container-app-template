@@ -1,67 +1,58 @@
 # .github/workflows/cd-trigger.yml
-name: CD - Trigger Deployment
+name: CD – Trigger Deployment
 
 on:
-  # Trigger deployment to 'dev' automatically when 'main' branch is updated
+  # Automatic deploy to dev on every push to main
   push:
-    branches:
-      - main
+    branches: [ main ]
 
-  # Allow manual triggering for promotion (typically to 'prod')
+  # Manual promotion (typically to prod)
   workflow_dispatch:
     inputs:
       environment:
-        description: 'Target environment for manual promotion (usually prod)'
+        description: Target environment for manual promotion (usually prod)
         required: true
-        type: environment # Use environment type for dropdown list based on repo environments
+        type: environment
       commit_sha:
-        description: 'Optional: Specific commit SHA to deploy (defaults to latest commit on default branch)'
+        description: Optional commit SHA to deploy (defaults to latest on default branch)
         required: false
-        default: '' # Default to empty, workflow will use github.sha or github.ref
+        default: ''
 
-# Permissions are handled by the called workflow based on the environment context.
-# Top-level permissions removed as they are not needed here.
-
+# ────────────────────────────────────────────────────────────────────────────────
 jobs:
-  # 1. Prepare parameters
+  # 1️⃣ Work out where/what to deploy
   prepare:
     runs-on: ubuntu-latest
     outputs:
       target_env: ${{ steps.params.outputs.TARGET_ENV }}
-      git_ref: ${{ steps.params.outputs.GIT_REF }}
+      git_ref:    ${{ steps.params.outputs.GIT_REF }}
+
     steps:
-      - name: Determine Deployment Parameters
+      - name: Determine deployment parameters
         id: params
+        shell: bash
         run: |
           if [[ "${{ github.event_name }}" == "push" ]]; then
-            echo "TARGET_ENV=dev" >> $GITHUB_OUTPUT
-            echo "GIT_REF=${{ github.ref }}" >> $GITHUB_OUTPUT # Use branch ref for push
+            echo "TARGET_ENV=dev"    >>"$GITHUB_OUTPUT"
+            echo "GIT_REF=${{ github.ref }}" >>"$GITHUB_OUTPUT"
           elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "TARGET_ENV=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
-            # Use specified commit SHA if provided, otherwise use the ref the workflow runs on
+            echo "TARGET_ENV=${{ github.event.inputs.environment }}" >>"$GITHUB_OUTPUT"
             GIT_REF="${{ github.event.inputs.commit_sha }}"
-            if [[ -z "$GIT_REF" ]]; then
-              GIT_REF="${{ github.ref }}"
-            fi
-            echo "GIT_REF=$GIT_REF" >> $GITHUB_OUTPUT
+            [[ -z "$GIT_REF" ]] && GIT_REF="${{ github.ref }}"
+            echo "GIT_REF=$GIT_REF" >>"$GITHUB_OUTPUT"
           else
-            echo "Error: Unsupported event type ${{ github.event_name }}"
-            exit 1
+            echo "Unsupported event type ${{ github.event_name }}"; exit 1
           fi
-        shell: bash
 
-  # 2. Call the reusable workflow in a *job*, not a step
+  # 2️⃣ Call the reusable deployment workflow
   deploy:
     needs: prepare
-    # Define environment context here for secrets/variables
-    environment: ${{ needs.prepare.outputs.target_env }}
-    # Call reusable workflow at job level
-    uses: ./.github/workflows/cd-deploy.yml
+    uses: ./.github/workflows/cd-deploy.yml     # local reusable workflow
     with:
-      environment: ${{ needs.prepare.outputs.target_env }}
-      tf_vars_file: ${{ vars.TF_VARS_FILE }}             # Variable from GitHub Environment
-      project_prefix: ${{ vars.PROJECT_PREFIX }}         # Variable from GitHub Environment
-      resource_group_name: ${{ vars.RESOURCE_GROUP_NAME }} # Variable from GitHub Environment
-      run_canary: ${{ vars.RUN_CANARY == 'true' }}       # Variable from GitHub Environment (convert string to boolean)
-      git_ref: ${{ needs.prepare.outputs.git_ref }}       # Pass the determined ref from prepare job
-    secrets: inherit # Inherit all secrets from the environment context
+      environment:          ${{ needs.prepare.outputs.target_env }}
+      tf_vars_file:         ${{ vars.TF_VARS_FILE }}
+      project_prefix:       ${{ vars.PROJECT_PREFIX }}
+      resource_group_name:  ${{ vars.RESOURCE_GROUP_NAME }}
+      run_canary:           ${{ vars.RUN_CANARY == 'true' }}
+      git_ref:              ${{ needs.prepare.outputs.git_ref }}
+    secrets: inherit                                # pass *all* secrets down
