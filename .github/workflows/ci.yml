@@ -92,4 +92,5 @@ jobs:
           severity: 'CRITICAL,HIGH' # Scan for CRITICAL and HIGH severity vulnerabilities
 
       - name: Print Image Digest (for reference)
-        run: echo "Image digest: ${{ steps.docker_build.outputs.digest }}"
+        run: |
+          echo "Image digest: ${{ steps.docker_build.outputs.digest }}"

@@ -19,7 +19,8 @@ on:
         required: false
         default: '' # Default to empty, workflow will use github.sha or github.ref
 
-permissions: read-only # Permissions are handled by the called workflow
+# Permissions are handled by the called workflow based on the environment context.
+# Top-level permissions removed as they are not needed here.
 
 jobs:
   trigger-deployment:
@@ -52,7 +53,7 @@ jobs:
       # Call the reusable deployment workflow
       # Secrets and Variables are automatically sourced from the selected GitHub Environment
       - name: Call Reusable Deploy Workflow
-        uses: ./.github/workflows/cd-deploy.yml@${{ steps.params.outputs.GIT_REF }} # Use the determined ref
+        uses: ./.github/workflows/cd-deploy.yml # Use local path, ref is implicit
         with:
           environment: ${{ steps.params.outputs.TARGET_ENV }}
           tf_vars_file: ${{ vars.TF_VARS_FILE }}             # Variable from GitHub Environment
