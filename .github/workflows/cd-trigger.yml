@@ -23,13 +23,13 @@ on:
 # Top-level permissions removed as they are not needed here.
 
 jobs:
-  trigger-deployment:
+  # 1. Prepare parameters
+  prepare:
     runs-on: ubuntu-latest
-    # Determine target environment: 'dev' for push to main, input for dispatch
-    environment: ${{ github.event_name == 'push' && 'dev' || github.event.inputs.environment }}
-
+    outputs:
+      target_env: ${{ steps.params.outputs.TARGET_ENV }}
+      git_ref: ${{ steps.params.outputs.GIT_REF }}
     steps:
-      # Step to determine inputs for the reusable workflow based on trigger type
       - name: Determine Deployment Parameters
         id: params
         run: |
@@ -50,22 +50,18 @@ jobs:
           fi
         shell: bash
 
-      # Call the reusable deployment workflow
-      # Secrets and Variables are automatically sourced from the selected GitHub Environment
-      - name: Call Reusable Deploy Workflow
-        uses: ./.github/workflows/cd-deploy.yml # Use local path, ref is implicit
-        with:
-          environment: ${{ steps.params.outputs.TARGET_ENV }}
-          tf_vars_file: ${{ vars.TF_VARS_FILE }}             # Variable from GitHub Environment
-          project_prefix: ${{ vars.PROJECT_PREFIX }}         # Variable from GitHub Environment
-          resource_group_name: ${{ vars.RESOURCE_GROUP_NAME }} # Variable from GitHub Environment
-          run_canary: ${{ vars.RUN_CANARY == 'true' }}       # Variable from GitHub Environment (convert string to boolean)
-          git_ref: ${{ steps.params.outputs.GIT_REF }}       # Pass the determined ref
-        secrets:
-          # Secrets are inherited from the GitHub Environment context
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          TF_STATE_STORAGE_ACCOUNT: ${{ secrets.TF_STATE_STORAGE_ACCOUNT }}
-          TF_STATE_CONTAINER: ${{ secrets.TF_STATE_CONTAINER }}
-          TF_STATE_RG: ${{ secrets.TF_STATE_RG }}
+  # 2. Call the reusable workflow in a *job*, not a step
+  deploy:
+    needs: prepare
+    # Define environment context here for secrets/variables
+    environment: ${{ needs.prepare.outputs.target_env }}
+    # Call reusable workflow at job level
+    uses: ./.github/workflows/cd-deploy.yml
+    with:
+      environment: ${{ needs.prepare.outputs.target_env }}
+      tf_vars_file: ${{ vars.TF_VARS_FILE }}             # Variable from GitHub Environment
+      project_prefix: ${{ vars.PROJECT_PREFIX }}         # Variable from GitHub Environment
+      resource_group_name: ${{ vars.RESOURCE_GROUP_NAME }} # Variable from GitHub Environment
+      run_canary: ${{ vars.RUN_CANARY == 'true' }}       # Variable from GitHub Environment (convert string to boolean)
+      git_ref: ${{ needs.prepare.outputs.git_ref }}       # Pass the determined ref from prepare job
+    secrets: inherit # Inherit all secrets from the environment context
